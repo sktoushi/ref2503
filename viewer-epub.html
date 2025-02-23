@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>View EPUB</title>
+  <style>
+    html, body {
+      margin: 0; 
+      padding: 0; 
+      height: 100%; 
+      overflow: hidden;
+    }
+    #viewer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+
+  <!-- Load ePub.js from a CDN -->
+  <script src="https://unpkg.com/epubjs/dist/epub.js"></script>
+  
+  <script>
+    function getUrlParams() {
+      const params = new URLSearchParams(window.location.search);
+      return {
+        fileName: params.get('fileName') || 'default.epub',
+        startIdx: parseInt(params.get('startIdx')) || 1,
+        endIdx: parseInt(params.get('endIdx')) || 1
+      };
+    }
+
+    function getRandomPage(startIdx, endIdx) {
+      return Math.floor(Math.random() * (endIdx - startIdx + 1)) + startIdx;
+    }
+
+    function displayEpub() {
+      const { fileName, startIdx, endIdx } = getUrlParams();
+      const randomPage = getRandomPage(startIdx, endIdx);
+
+      // Create a new ePub Book instance
+      const book = ePub(fileName);
+
+      // Render the book into the "viewer" element
+      const rendition = book.renderTo("viewer", {
+        width: "100%",
+        height: "100%"
+      });
+
+      // Once the book is ready, display the random page
+      book.ready.then(() => {
+        rendition.display(randomPage);
+      });
+    }
+  </script>
+</head>
+
+<body onload="displayEpub()">
+  <div id="viewer"></div>
+</body>
+</html>
