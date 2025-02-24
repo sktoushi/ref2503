@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>View PDF with Chunked LocalStorage</title>
+  <title>View PDF (IndexedDB Version)</title>
   <style>
     body, html {
       margin: 0;
@@ -21,9 +21,72 @@
     }
   </style>
   <script>
-    const CHUNK_SIZE = 20 * 1024; // 200 KB
+    /***************************/
+    /*   1) IndexedDB Helpers  */
+    /***************************/
 
-    // Get query parameters
+    // Open (or create) our IndexedDB database
+    function openPdfDB() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open('pdfDatabase', 1);
+
+        // Create the object store if needed
+        request.onupgradeneeded = function(event) {
+          const db = event.target.result;
+          if (!db.objectStoreNames.contains('pdfs')) {
+            db.createObjectStore('pdfs'); // key-value store
+          }
+        };
+
+        request.onsuccess = function(event) {
+          const db = event.target.result;
+          resolve(db);
+        };
+
+        request.onerror = function(event) {
+          reject(`IndexedDB error: ${event.target.error}`);
+        };
+      });
+    }
+
+    // Retrieve a stored PDF Blob by key (i.e., fileName)
+    function getPdfBlob(db, fileName) {
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction('pdfs', 'readonly');
+        const store = transaction.objectStore('pdfs');
+        const request = store.get(fileName);
+
+        request.onsuccess = () => {
+          // If the PDF was found, request.result is a Blob; if not found, it's undefined
+          resolve(request.result || null);
+        };
+        request.onerror = (event) => {
+          reject(`getPdfBlob error: ${event.target.error}`);
+        };
+      });
+    }
+
+    // Store a PDF Blob in the 'pdfs' object store
+    function putPdfBlob(db, fileName, blob) {
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction('pdfs', 'readwrite');
+        const store = transaction.objectStore('pdfs');
+        const request = store.put(blob, fileName);
+
+        request.onsuccess = () => {
+          resolve(true);
+        };
+        request.onerror = (event) => {
+          reject(`putPdfBlob error: ${event.target.error}`);
+        };
+      });
+    }
+
+    /***************************/
+    /*   2) PDF Display Logic  */
+    /***************************/
+
+    // Parse query parameters for fileName, startIdx, endIdx
     function getUrlParams() {
       const params = new URLSearchParams(window.location.search);
       return {
@@ -38,185 +101,69 @@
       return Math.floor(Math.random() * (endIdx - startIdx + 1)) + startIdx;
     }
 
-    // Embed the PDF (data URL or direct file) with a specific page
-    function showPdf(srcUrl, pageNumber) {
-      document.getElementById('pdfEmbed').src = srcUrl + '#page=' + pageNumber;
-    }
-
-    // If storing or reassembling fails, revert to showing the PDF from the original source
+    // Fallback: simply embed the PDF from its file path + #page=
     function revertToOriginal(fileName, pageNumber) {
       console.warn('Reverting to original PDF source...');
-      showPdf(fileName, pageNumber);
+      const pdfEmbed = document.getElementById('pdfEmbed');
+      pdfEmbed.src = `${fileName}#page=${pageNumber}`;
     }
 
-    // Store the PDF as multiple base64-encoded chunks in localStorage
-    async function storePdfChunks(fileName, blob) {
-      // Convert to ArrayBuffer
-      const arrayBuffer = await blob.arrayBuffer();
-      const byteArray = new Uint8Array(arrayBuffer);
-
-      // Calculate number of chunks
-      const totalChunks = Math.ceil(byteArray.length / CHUNK_SIZE);
-
-      // Remove old chunks if they exist
-      clearPdfChunks(fileName);
-
-      for (let i = 0; i < totalChunks; i++) {
-        const start = i * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, byteArray.length);
-        // Slice out this chunk
-        const chunk = byteArray.slice(start, end);
-        // Convert chunk to base64
-        const base64Chunk = await arrayBufferToBase64(chunk);
-        // Store in localStorage
-        localStorage.setItem(`${fileName}-chunk-${i}`, base64Chunk);
-      }
-      // Store metadata: number of chunks
-      localStorage.setItem(`${fileName}-chunk-count`, totalChunks.toString());
+    // Show the PDF in the <embed> using a Data URL or Object URL + #page=
+    // (Either approach works, but for "page=..." fragments, Data URLs are more consistent.)
+    function showPdfUsingDataUrl(pdfBlob, pageNumber) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const dataUrl = reader.result;
+        const pdfEmbed = document.getElementById('pdfEmbed');
+        pdfEmbed.src = dataUrl + `#page=${pageNumber}`;
+      };
+      reader.readAsDataURL(pdfBlob);
     }
 
-    // Clear any old chunks for a file
-    function clearPdfChunks(fileName) {
-      const chunkCount = parseInt(localStorage.getItem(`${fileName}-chunk-count`) || '0', 10);
-      for (let i = 0; i < chunkCount; i++) {
-        localStorage.removeItem(`${fileName}-chunk-${i}`);
-      }
-      localStorage.removeItem(`${fileName}-chunk-count`);
-    }
-
-    // Convert a small Uint8Array chunk to base64 string
-    function arrayBufferToBase64(u8Arr) {
-      return new Promise((resolve, reject) => {
-        try {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            // "reader.result" will be something like: "data:application/octet-stream;base64,...."
-            // We only want the base64 part after the comma
-            const resultStr = reader.result;
-            resolve(resultStr);
-          };
-          reader.readAsDataURL(new Blob([u8Arr]));
-        } catch (err) {
-          reject(err);
-        }
-      });
-    }
-
-    // Attempt to reassemble all chunks into a single base64 data URL for embedding
-    async function reassemblePdf(fileName) {
-      const chunkCount = parseInt(localStorage.getItem(`${fileName}-chunk-count`) || '0', 10);
-      if (!chunkCount) return null;
-
-      // We'll decode each chunk from a "data:...base64," URL to raw bytes,
-      // then combine them all into one large Uint8Array, and build a final data URL.
-      let totalBytes = 0;
-      const chunkArrays = [];
-
-      for (let i = 0; i < chunkCount; i++) {
-        const base64Url = localStorage.getItem(`${fileName}-chunk-${i}`);
-        if (!base64Url) {
-          console.warn('Missing chunk ' + i + ' in localStorage');
-          return null;
-        }
-        const byteArray = await base64UrlToUint8Array(base64Url);
-        chunkArrays.push(byteArray);
-        totalBytes += byteArray.length;
-      }
-
-      // Combine all chunks into one array
-      const combined = new Uint8Array(totalBytes);
-      let offset = 0;
-      for (const arr of chunkArrays) {
-        combined.set(arr, offset);
-        offset += arr.length;
-      }
-
-      // Convert the combined array to a single base64 PDF data URL
-      return uint8ArrayToDataUrl(combined);
-    }
-
-    // Convert a base64 data URL back into a Uint8Array
-    function base64UrlToUint8Array(base64Url) {
-      return new Promise((resolve, reject) => {
-        try {
-          // Create a Blob from the data URL
-          fetch(base64Url)
-            .then(res => res.blob())
-            .then(blob => blob.arrayBuffer())
-            .then(buffer => {
-              resolve(new Uint8Array(buffer));
-            })
-            .catch(err => reject(err));
-        } catch (err) {
-          reject(err);
-        }
-      });
-    }
-
-    // Convert a Uint8Array to a base64 data URL (with PDF MIME type)
-    function uint8ArrayToDataUrl(u8Arr) {
-      return new Promise((resolve, reject) => {
-        try {
-          const blob = new Blob([u8Arr], { type: 'application/pdf' });
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            resolve(reader.result); // data:application/pdf;base64,...
-          };
-          reader.readAsDataURL(blob);
-        } catch (err) {
-          reject(err);
-        }
-      });
-    }
-
-    async function displayPdf() {
+    // Main function
+    function displayPdf() {
       const { fileName, startIdx, endIdx } = getUrlParams();
       const randomPage = getRandomPage(startIdx, endIdx);
 
-      // Try to reassemble from localStorage first
-      try {
-        const dataUrl = await reassemblePdf(fileName);
-        if (dataUrl) {
-          // If we successfully reassembled it, display from localStorage
-          showPdf(dataUrl, randomPage);
-          return;
-        }
-      } catch (err) {
-        console.warn('Failed to reassemble PDF from chunks:', err);
-      }
-
-      // If not in localStorage or reassembly fails, fetch from network
-      fetch(fileName)
-        .then(response => {
-          if (!response.ok) {
-            throw new Error('Network response was not ok: ' + response.statusText);
-          }
-          return response.blob();
+      openPdfDB()
+        .then(db => {
+          // Try to retrieve from IndexedDB first
+          return getPdfBlob(db, fileName)
+            .then(cachedBlob => {
+              if (cachedBlob) {
+                // If found, show it from the cache
+                showPdfUsingDataUrl(cachedBlob, randomPage);
+              } else {
+                // Otherwise, fetch from the server, store it, then show
+                fetch(fileName)
+                  .then(response => {
+                    if (!response.ok) {
+                      throw new Error('Network response was not ok: ' + response.statusText);
+                    }
+                    return response.blob();
+                  })
+                  .then(blob => {
+                    putPdfBlob(db, fileName, blob)
+                      .then(() => {
+                        // Successfully saved in IndexedDB, display it
+                        showPdfUsingDataUrl(blob, randomPage);
+                      })
+                      .catch(err => {
+                        console.error('Error storing PDF in IndexedDB:', err);
+                        // Fallback to original method
+                        revertToOriginal(fileName, randomPage);
+                      });
+                  })
+                  .catch(err => {
+                    console.error('Error fetching PDF from server:', err);
+                    revertToOriginal(fileName, randomPage);
+                  });
+              }
+            });
         })
-        .then(async blob => {
-          try {
-            // Try storing in localStorage as chunks
-            await storePdfChunks(fileName, blob);
-
-            // Confirm it was stored properly by reassembling
-            const reassembled = await reassemblePdf(fileName);
-            if (!reassembled) {
-              console.warn('Failed to confirm reassembled PDF. Reverting to original.');
-              revertToOriginal(fileName, randomPage);
-              return;
-            }
-            // If all good, display from chunked localStorage
-            showPdf(reassembled, randomPage);
-          } catch (error) {
-            // Usually QUOTA_EXCEEDED_ERR or other chunking error
-            console.error('Failed to store in localStorage:', error);
-            // Revert to original
-            revertToOriginal(fileName, randomPage);
-          }
-        })
-        .catch(error => {
-          console.error('Error fetching or reading PDF:', error);
-          // If fetch fails, revert to original process
+        .catch(err => {
+          // If opening DB fails or anything else breaks, revert to original
+          console.error('IndexedDB not available or error occurred:', err);
           revertToOriginal(fileName, randomPage);
         });
     }
