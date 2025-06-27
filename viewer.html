@@ -1,175 +1,40 @@
+<!-- viewer.html  – thin wrapper that redirects to viewer-range-plus.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>View PDF (IndexedDB Version)</title>
-  <style>
-    body, html {
-      margin: 0;
-      padding: 0;
-      height: 100%;
-      overflow: hidden;
-    }
-    #pdfEmbed {
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      border: none;
-    }
-  </style>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>Redirecting …</title>
   <script>
-    /***************************/
-    /*   1) IndexedDB Helpers  */
-    /***************************/
+    (function () {
+      /* ── 1. raw parts of current URL ────────────────────────────── */
+      const rawSearch = window.location.search;      // includes leading “?”
+      const rawHash   = window.location.hash;        // may be "" | "#" | "#!"
+      const hasPlus   = rawSearch.endsWith("+");     // legacy plus-mode flag
 
-    // Open (or create) our IndexedDB database
-    function openPdfDB() {
-      return new Promise((resolve, reject) => {
-        const request = indexedDB.open('pdfDatabase', 1);
+      /* ── 2. parse search params (strip trailing “+” first) ──────── */
+      const baseSearch = hasPlus ? rawSearch.slice(0, -1) : rawSearch;
+      const p = new URLSearchParams(baseSearch.slice(1));   // drop leading “?”
 
-        // Create the object store if needed
-        request.onupgradeneeded = function(event) {
-          const db = event.target.result;
-          if (!db.objectStoreNames.contains('pdfs')) {
-            db.createObjectStore('pdfs'); // key-value store
-          }
-        };
+      /* ── 3. legacy startIdx / endIdx  → randIdx ─────────────────── */
+      const s = +p.get("startIdx"), e = +p.get("endIdx");
+      if (!p.has("randIdx") && Number.isFinite(s) && Number.isFinite(e)) {
+        p.set("randIdx", Math.floor(Math.random() * (e - s + 1)) + s);
+      }
+      p.delete("startIdx");
+      p.delete("endIdx");
 
-        request.onsuccess = function(event) {
-          const db = event.target.result;
-          resolve(db);
-        };
+      /* ── 4. rebuild search string (re-append “+” if needed) ─────── */
+      let newSearch = "?" + p.toString();
+      if (hasPlus) newSearch += "+";
 
-        request.onerror = function(event) {
-          reject(`IndexedDB error: ${event.target.error}`);
-        };
-      });
-    }
-
-    // Retrieve a stored PDF Blob by key (i.e., fileName)
-    function getPdfBlob(db, fileName) {
-      return new Promise((resolve, reject) => {
-        const transaction = db.transaction('pdfs', 'readonly');
-        const store = transaction.objectStore('pdfs');
-        const request = store.get(fileName);
-
-        request.onsuccess = () => {
-          // If the PDF was found, request.result is a Blob; if not found, it's undefined
-          resolve(request.result || null);
-        };
-        request.onerror = (event) => {
-          reject(`getPdfBlob error: ${event.target.error}`);
-        };
-      });
-    }
-
-    // Store a PDF Blob in the 'pdfs' object store
-    function putPdfBlob(db, fileName, blob) {
-      return new Promise((resolve, reject) => {
-        const transaction = db.transaction('pdfs', 'readwrite');
-        const store = transaction.objectStore('pdfs');
-        const request = store.put(blob, fileName);
-
-        request.onsuccess = () => {
-          resolve(true);
-        };
-        request.onerror = (event) => {
-          reject(`putPdfBlob error: ${event.target.error}`);
-        };
-      });
-    }
-
-    /***************************/
-    /*   2) PDF Display Logic  */
-    /***************************/
-
-    // Parse query parameters for fileName, startIdx, endIdx
-    function getUrlParams() {
-      const params = new URLSearchParams(window.location.search);
-      return {
-        fileName: params.get('fileName') || 'default.pdf',
-        startIdx: parseInt(params.get('startIdx')) || 1,
-        endIdx: parseInt(params.get('endIdx')) || 1,
-      };
-    }
-
-    // Generate a random page within the startIdx and endIdx
-    function getRandomPage(startIdx, endIdx) {
-      return Math.floor(Math.random() * (endIdx - startIdx + 1)) + startIdx;
-    }
-
-    // Fallback: simply embed the PDF from its file path + #page=
-    function revertToOriginal(fileName, pageNumber) {
-      console.warn('Reverting to original PDF source...');
-      const pdfEmbed = document.getElementById('pdfEmbed');
-      pdfEmbed.src = `${fileName}#page=${pageNumber}`;
-    }
-
-    // Show the PDF in the <embed> using a Data URL or Object URL + #page=
-    // (Either approach works, but for "page=..." fragments, Data URLs are more consistent.)
-    function showPdfUsingDataUrl(pdfBlob, pageNumber) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const dataUrl = reader.result;
-        const pdfEmbed = document.getElementById('pdfEmbed');
-        pdfEmbed.src = dataUrl + `#page=${pageNumber}`;
-      };
-      reader.readAsDataURL(pdfBlob);
-    }
-
-    // Main function
-    function displayPdf() {
-      const { fileName, startIdx, endIdx } = getUrlParams();
-      const randomPage = getRandomPage(startIdx, endIdx);
-
-      openPdfDB()
-        .then(db => {
-          // Try to retrieve from IndexedDB first
-          return getPdfBlob(db, fileName)
-            .then(cachedBlob => {
-              if (cachedBlob) {
-                // If found, show it from the cache
-                showPdfUsingDataUrl(cachedBlob, randomPage);
-              } else {
-                // Otherwise, fetch from the server, store it, then show
-                fetch(fileName)
-                  .then(response => {
-                    if (!response.ok) {
-                      throw new Error('Network response was not ok: ' + response.statusText);
-                    }
-                    return response.blob();
-                  })
-                  .then(blob => {
-                    putPdfBlob(db, fileName, blob)
-                      .then(() => {
-                        // Successfully saved in IndexedDB, display it
-                        showPdfUsingDataUrl(blob, randomPage);
-                      })
-                      .catch(err => {
-                        console.error('Error storing PDF in IndexedDB:', err);
-                        // Fallback to original method
-                        revertToOriginal(fileName, randomPage);
-                      });
-                  })
-                  .catch(err => {
-                    console.error('Error fetching PDF from server:', err);
-                    revertToOriginal(fileName, randomPage);
-                  });
-              }
-            });
-        })
-        .catch(err => {
-          // If opening DB fails or anything else breaks, revert to original
-          console.error('IndexedDB not available or error occurred:', err);
-          revertToOriginal(fileName, randomPage);
-        });
-    }
+      /* ── 5. redirect to viewer-range-plus.html ──────────────────── */
+      const newURL = "viewer-range-plus.html" + newSearch + rawHash;
+      window.location.replace(newURL);   // keeps browser history clean
+    })();
   </script>
 </head>
-<body onload="displayPdf()">
-  <embed id="pdfEmbed" src="" type="application/pdf" />
+<body>
+  <noscript>Please enable JavaScript to view this document.</noscript>
 </body>
 </html>
